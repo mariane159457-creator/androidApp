@@ -1,34 +1,7 @@
 #!/usr/bin/env python3
-"""phoneagent v4 (root): agente de IA que controla o Android via ROOT/su (Termux, sem ADB) usando Ollama.
-
-Uso:
-  python agent.py "faca a atividade aberta no busuu"
-  python agent.py                      # modo interativo
-  python agent.py --doctor             # confere dependencias
-  python agent.py --test-audio         # testa gravacao + transcricao (toque um audio)
-
-Versao root: toques, teclas, tela, apps e permissoes rodam via su (nada de adb). shell aceita "root":true.
-
-Novidades da v2:
-  * Audio: grava o MICROFONE *antes* de dar play (nao perde audios curtos), espera o audio terminar,
-    converte e transcreve com whisper.cpp (local, gratis, offline). Legenda ao vivo vira so plano B.
-  * Detecta video/audio com autoplay: espera acabar e repete do inicio.
-  * Textos longos: acao read_all rola a tela sozinha e devolve o texto completo.
-  * Telas sem arvore de UI (Flutter, jogos, video): screenshot com GRADE (A1..F12) para tocar com precisao.
-  * zoom em regioes pequenas, scroll mais natural, JSON mais tolerante, keep_alive no Ollama.
-  * Terminal: shell, read_file, write_file, send_file (comandos e arquivos do Termux, sem depender da tela).
-Novidades da v4 (como um Claude Code para o celular):
-  * Roda de QUALQUER pasta (comando `phoneagent`/`pa`): a pasta atual e o diretorio de trabalho; le PHONEAGENT.md/AGENTS.md/CLAUDE.md.
-  * SEGURANCA POR CODIGO: so apaga/sobrescreve o que o proprio agente criou; arquivos alheios exigem OK do humano (force nao burla).
-  * Pasta temporaria propria ($PA_TMP) apagada sozinha no fim + faxina de temporarios criados: nada de arquivos soltos.
-  * Internet: web_search, web_fetch, download (com retomada). Pesquisa e baixa sozinho.
-  * Honestidade: relatorio final MEDIDO pelo sistema (arquivos reais, tamanhos); done com deliverables e verificado.
-  * Mais rapido: shell em lote (cmds), prompt enxuto p/ terminal, sem espera apos comandos, raciocinio leve nos passos simples.
-Somente biblioteca padrao do Python (Pillow opcional, mas recomendado).
-"""
+"""Agente textual para Termux: shell, arquivos e web, sem root e sem automacao Android."""
 import argparse
 import base64
-import glob
 import hashlib
 import io
 import json
@@ -96,7 +69,7 @@ SELECT_VERB_RE = re.compile(r"\b(select|choose|pick|highlight|underline|find|ide
 SELECT_N_RE = re.compile(r"\b(\d{1,2}|" + "|".join(sorted(NUM_WORDS, key=len, reverse=True)) + r")[\s-]+(?:words?|palavras?)\b")
 SEL_RATIO = 0.55  # fracao do contorno do chip que precisa estar azul para contar como selecionado
 PNG_SIG = b"\x89PNG\r\n\x1a\n"
-BUILD = "2026-10-29-v6"  # mude a cada entrega para confirmar no log que o arquivo certo esta rodando
+BUILD = "2026-11-23-text-only"
 STOP_WORDS = set("""a o os as um uma de do da dos das e em no na nos nas para por com sem que se ao aos entre sobre the and for with
 from into that this then also use using app apps application baixe baixar baixa download install instale instalar abra abrir abre open
 entrar acesse acessar acessa ir va vai faca fazer tarefa task site pagina page quero want please favor tambem gratuito gratis free
@@ -673,13 +646,8 @@ SIMPLE_WRITE_RE = re.compile(r"\b(cri(e|ar)|baix\w*|download(?:ar|e)|instal\w*|c
 
 
 def task_kind(task):
-    """'terminal' ou 'screen'. Padrao = TERMINAL: so vai para a tela quando o pedido fala claramente de app/site/toque.
-    Empate -> terminal. (Se um pedido de terminal precisar da tela, o agente escala sozinho; ver _run.)"""
-    intent = brain.parse_intent(task)
-    if intent and intent.kind in ("music", "music_control"):
-        return "screen"
-    t, u = len(TERM_HINT_RE.findall(task)), len(UI_HINT_RE.findall(task))
-    return "screen" if u > t else "terminal"
+    """Esta edicao trata qualquer pedido apenas por ferramentas de texto."""
+    return "terminal"
 
 
 def task_is_terminal(task):
@@ -699,68 +667,48 @@ def task_is_simple(task):
             and not CONSTRAINT_RE.search(task) and not DELIVERY_RE.search(task.lower()))
 
 
-# ---------------------------------------------------------------- ROOT (su)
-SU_PATHS = ("/system/bin/su", "/system/xbin/su", "/sbin/su", "/debug_ramdisk/su", "/data/adb/ksu/bin/su",
-            "/data/adb/magisk/su", "/vendor/bin/su", "/su/bin/su")
-# O Termux exporta LD_PRELOAD (termux-exec) e poe os binarios dele no PATH; isso atrapalha input/screencap/am/pm como root.
-# Binarios do Android primeiro (o "am" do Termux e um wrapper que nao serve para root). HOME = home do Termux para o "~" funcionar.
-ROOT_ENV = ("unset LD_PRELOAD LD_LIBRARY_PATH; umask 022; export HOME=" + shlex.quote(HOME)
-            + " PATH=/system/bin:/system/xbin:/vendor/bin:/product/bin:$PATH; ")
+# ---------------------------------------------------------------- Termux sem root
+class TermuxDevice:
+    """Executa apenas comandos do usuario Termux; nao tenta elevar privilegios nem ler/controlar a tela."""
+    su = None
 
-
-def find_su():
-    for p in SU_PATHS:
-        if os.access(p, os.X_OK):
-            return p
-    return shutil.which("su")
-
-
-class Root:
-    """Controla o Android como root (su), sem ADB: input, screencap, uiautomator, pm, am e dumpsys rodam direto no aparelho."""
     def __init__(self):
-        self.su = None if os.geteuid() == 0 else find_su()
-        if os.geteuid() != 0 and not self.su:
-            sys.exit("su nao encontrado. Confira o root (Magisk/KernelSU) e teste: su -c id")
-        log("    (pedindo root; aceite no Magisk/KernelSU se aparecer o aviso)")
-        if self.sh("id -u", timeout=60).strip() != "0":
-            sys.exit("root negado. Abra o Magisk/KernelSU > Superusuario e permita o Termux.")
+        if os.geteuid() == 0:
+            raise RuntimeError("Nao execute o PhoneAgent como root; abra uma sessao normal do Termux.")
 
     def argv(self, cmd):
-        full = ROOT_ENV + cmd
-        return ["sh", "-c", full] if self.su is None else [self.su, "-c", full]
+        return ["sh", "-c", cmd]
 
     def sh(self, cmd, binary=False, timeout=30):
         empty = b"" if binary else ""
         try:
-            r = subprocess.run(self.argv(cmd), capture_output=True, timeout=timeout, stdin=subprocess.DEVNULL)
+            result = subprocess.run(self.argv(cmd), capture_output=True, timeout=timeout, stdin=subprocess.DEVNULL)
         except subprocess.TimeoutExpired:
-            log(f"    (comando root travou >{timeout}s em: {cmd[:40]})")
             return empty
-        if r.returncode != 0 and b"denied" in r.stderr.lower() and not getattr(self, "warned", False):
-            self.warned = True
-            log("    (su negou o acesso: libere o Termux no Magisk/KernelSU)")
-        return r.stdout if binary else r.stdout.decode("utf-8", "replace")
+        return result.stdout if binary else result.stdout.decode("utf-8", "replace")
 
     def dump(self):
-        """uiautomator trava/falha em telas animadas: apaga o arquivo antigo, limita o tempo e mata resto de processo.
-        Depois de uma falha usa tentativa unica e curta (nao perde ~20s por turno)."""
-        slow = getattr(self, "dump_fail", 0) >= 1
-        inner = 5 if slow else 10
-        cmd = (f"rm -f {UI_TMP}; if command -v timeout >/dev/null 2>&1; then timeout {inner} uiautomator dump {UI_TMP}; "
-               f"else uiautomator dump {UI_TMP}; fi >/dev/null 2>&1; cat {UI_TMP} 2>/dev/null")
-        for _ in range(1 if slow else 2):
-            out = self.sh(cmd, timeout=inner + 8)
-            if "<hierarchy" in out:
-                self.dump_fail = 0
-                return out
-            self.sh("pkill -f uiautomator >/dev/null 2>&1; true", timeout=5)
-            time.sleep(0.6)
-        self.dump_fail = getattr(self, "dump_fail", 0) + 1
         return ""
 
     def screenshot(self):
-        png = self.sh("screencap -p", binary=True, timeout=30)
-        return png if png[:8] == PNG_SIG else png.replace(b"\r\n", b"\n")  # su com pty converte \n em \r\n
+        return b""
+
+
+SYSTEM_TEXT_ONLY = """You are PhoneAgent, a text-only assistant running as the regular Termux user. Never use root, su, sudo, tsu, Android screen access, microphone, speech recognition, or app automation.
+Reply with exactly one JSON object per turn: {"thought":"brief","action":"...", ...parameters at top level}.
+
+Available actions:
+- shell {"cmd":"...","timeout":30} runs a regular Termux shell command. Never request root or privilege escalation.
+- read_file {"path":"...","max_chars":6000}
+- write_file {"path":"...","content":"...","append":false}
+- find_path {"name":"..."}
+- web_search {"query":"...","n":6}
+- web_fetch {"url":"https://...","max_chars":6000,"links":true}
+- download {"url":"https://...","path":"..."}
+- ask_user {"question":"..."}
+- done {"message":"...","deliverables":["..."]} or fail {"message":"..."}
+
+Only perform text, file, shell, and web tasks. If the task requires opening or controlling an app, changing Android settings, capturing audio, or reading app sound, call fail and explain that this text-only build does not provide those capabilities. Do not install, delete, or overwrite user data unless explicitly requested. Verify results before claiming completion."""
 
 
 def parse_ui(xml_text, maxtext=400, maxels=200):
@@ -1208,35 +1156,6 @@ def model_has_vision(model):
     except Exception:
         pass
     return bool(re.search(r"(vl|vision|llava|gemma[34]|minicpm-v|moondream|bakllava|granite3.2-vision|mistral-small3)", model.lower()))
-
-
-# ---------------------------------------------------------------- Audio (whisper.cpp)
-def find_whisper():
-    for n in ("whisper-cli", "whisper-cpp"):
-        p = shutil.which(n)
-        if p:
-            return p
-    for p in (os.path.join(HOME, "whisper.cpp/build/bin/whisper-cli"), os.path.join(HOME, ".local/bin/whisper-cli")):
-        if os.path.exists(p):
-            return p
-    return None
-
-
-def find_whisper_model(name):
-    env = os.environ.get("WHISPER_MODEL")
-    if env and os.path.exists(env):
-        return env
-    for d in (os.path.join(HOME, "whisper.cpp/models"), os.path.join(HOME, ".cache/whisper")):
-        p = os.path.join(d, f"ggml-{name}.bin")
-        if os.path.exists(p):
-            return p
-    others = [p for p in glob.glob(os.path.join(HOME, "whisper.cpp/models/ggml-*.bin")) if "for-tests" not in p]
-    return sorted(others)[0] if others else None
-
-
-def clean_asr(text):
-    text = re.sub(r"\[[^\]]*\]|\([^)]*\)|\*[^*]*\*", " ", text)  # [BLANK_AUDIO], (music) ...
-    return re.sub(r"\s+", " ", text).strip()
 
 
 # ---------------------------------------------------------------- Agente
@@ -1997,18 +1916,14 @@ class Agent(V4Mixin, brain.BrainMixin):
     simple, left_term, last_model, screen_task = False, False, None, ""
 
     def prompt_for(self, task):
-        """Terminal -> prompt de terminal; tela -> prompt enxuto (o completo, de licoes/quiz, so quando o pedido e uma licao)."""
-        if self.term_only:
-            return SYSTEM_TERM
-        return SYSTEM if LESSON_RE.search(task) else SYSTEM_SCREEN
+        return SYSTEM_TEXT_ONLY
 
     def __init__(self, dev, model, vision=True, delay=1.0, step=False, home=True, ctx=16384, timeout=180,
                  imgmax=1280, asr_model="base", audio_lang="auto"):
         self.dev, self.model, self.vision, self.delay, self.step, self.home = dev, model, vision, delay, step, home
         self.ctx, self.timeout, self.imgmax = ctx, timeout, imgmax
-        self.asr_model, self.audio_lang = asr_model, audio_lang
         self.els, self.W, self.H = [], 1080, 2400
-        self.debug, self.audio = False, True
+        self.debug, self.audio = False, False
         self.transcript, self.transcript_n, self.transcript_texts = "", 0, set()
         self.cur_step, self.act_kind, self.cur_texts = 0, None, set()
         self.last_png, self.zoom_b64, self.grid_mode, self.read_step = None, None, False, -99
@@ -2026,13 +1941,11 @@ class Agent(V4Mixin, brain.BrainMixin):
         self.tr, self.reads, self.events, self.tid_n = [], [], [], 0
         self.audio_fails, self.audio_block_until, self.player_opened = 0, 0, False
         self.last_tid, self.last_capture_step = None, -99
-        self.whisper, self.wmodel = find_whisper(), find_whisper_model(asr_model)
-        self.asr_ok = bool(self.whisper and self.wmodel and shutil.which("ffmpeg") and shutil.which("termux-microphone-record"))
         os.makedirs(WORK, exist_ok=True)
         self.v4_init()
         self._parse_ui = parse_ui
         self.brain_init()
-        self.sys_prompt = SYSTEM
+        self.sys_prompt = SYSTEM_TEXT_ONLY
 
     # ---- observacao
     def shoot(self):
@@ -2368,18 +2281,7 @@ class Agent(V4Mixin, brain.BrainMixin):
         return clean_asr(r.stdout)
 
     def capture_audio(self, xy, seconds=None):
-        """Wrapper: contabiliza falhas seguidas para nao ficar 'procurando audio' onde nao existe."""
-        res = self._capture_raw(xy, seconds)
-        if res.startswith("transcricao"):
-            self.audio_fails = 0
-            self.last_capture_step = self.cur_step
-        else:
-            self.audio_fails += 1
-            if self.audio_fails >= 3:
-                self.audio_block_until = self.cur_step + 6
-                self.audio_fails = 0
-                res += "\nSTOP: 3 failed audio captures in a row. Do not try audio again for a while; answer from images/text/memory."
-        return res
+        return "BLOCKED (not executed): captura e transcricao de audio foram removidas desta edicao textual."
 
     def _capture_raw(self, xy, seconds=None):
         """Grava ANTES do play e ate o audio ACABAR (ate audio_max s). Reinicia a gravacao se o Android a derrubar.
@@ -3638,26 +3540,23 @@ class Agent(V4Mixin, brain.BrainMixin):
     SU_WRAP_RE = re.compile(r"\b(?:su|tsu)\s+(?:0\s+sh\s+)?-c\s+(?P<q>[\"'])(?P<c>.*?)(?P=q)", re.S)
 
     def fix_shell(self, a):
-        """su -c "X" / sudo X / tsu viram root:true automaticamente (antes o guard bloqueava e o modelo perdia passos)."""
+        """Normaliza comandos em lote sem converter tentativas de root em comandos privilegiados."""
         cmds = a.get("cmds")
         if isinstance(cmds, list) and cmds and not (a.get("cmd") or a.get("command")):
             joined = " && ".join("{ " + str(c).strip().rstrip(";") + "; }" for c in cmds if str(c).strip())
             a = {**{k: v for k, v in a.items() if k != "cmds"}, "cmd": joined}
         cmd = str(a.get("cmd") or a.get("command") or "")
-        new, root = cmd, bool(a.get("root"))
-        if self.SU_WRAP_RE.search(new):
-            new, root = self.SU_WRAP_RE.sub(lambda m: m.group("c"), new), True
-        n2 = re.sub(r"(^|[;&|]\s*)(?:sudo|tsu)\s+", r"\1", new)
-        if n2 != new:
-            new, root = n2, True
-        if new == cmd and root == bool(a.get("root")):
+        if cmd == str(a.get("cmd") or a.get("command") or ""):
             return a
-        log(f"  {C.DIM}(su/sudo convertido para root:true){C.R}")
         out = {k: v for k, v in a.items() if k != "command"}
-        out["cmd"], out["root"] = new, root
+        out["cmd"] = cmd
         return out
 
     def term_guard(self, kind, a):
+        if kind == "shell":
+            cmd = str(a.get("cmd") or a.get("command") or "")
+            if a.get("root") or re.search(r"\b(?:su|sudo|tsu)\b", cmd):
+                return "BLOCKED (not executed): este agente nunca eleva privilégios; remova root/su/sudo/tsu do comando."
         if kind == "send_file" and a.get("path"):
             p = self.resolve_path(a["path"])
             n = self.sent_files.get(p, 0)
@@ -3678,8 +3577,8 @@ class Agent(V4Mixin, brain.BrainMixin):
             pipe_sh = re.search(r"\b(curl|wget)\b[^|;&]*\|\s*(ba|z)?sh\b", cmd_s)
             risky = DANGER_RE.search(self.analyze_cmd(cmd_s)["rest"])
             if (pipe_sh or risky) and not self.allow_risky and not (risky and not pipe_sh and a.get("force") and self.destructive_ok):
-                return ("BLOCKED (not executed): destructive/risky command (kill, uninstall, reboot, mount, su, pipe-to-shell...). "
-                        "For root use \"root\":true instead of su/sudo. It only runs when the TASK itself asks for something destructive.")
+                return ("BLOCKED (not executed): comando destrutivo/de risco (kill, uninstall, reboot, mount, pipe-to-shell...). "
+                    "O limite sem root não pode ser alterado por force.")
         if kind == "write_file" and a.get("path") and not a.get("append"):
             wp = self.resolve_path(a["path"])
             if os.path.exists(wp) and not self.can_touch(wp):
@@ -3700,6 +3599,8 @@ class Agent(V4Mixin, brain.BrainMixin):
 
     def term(self, cmd, timeout=30, root=False, _healed=False):
         cmd = str(cmd or "").strip()
+        if root:
+            return "BLOCKED (not executed): execução privilegiada não está disponível nesta edição."
         if not cmd:
             return "error: informe cmd"
         heavy = bool(self.HEAVY_RE.search(cmd))
@@ -3781,6 +3682,9 @@ class Agent(V4Mixin, brain.BrainMixin):
                 "set_device": "device", "toggle": "device", "setting": "device", "set_setting": "device",
                 "set_time": "time_picker_set", "picker": "time_picker_set"}.get(name, name)
         name = TERM_ALIAS.get(name, name)
+        if name in UI_ACTIONS or name in {"send_file", "set_alarm", "set_timer", "device", "speak", "screen"}:
+            return ("BLOCKED (not executed): esta edição aceita apenas comandos textuais no Termux; "
+                "controle de apps/tela, áudio e ajustes do Android estão desativados.")
         if name in TERM_KINDS:
             self.act_kind = name
         sh = self.dev.sh
@@ -4035,8 +3939,8 @@ class Agent(V4Mixin, brain.BrainMixin):
         self.loop_hits, self.last_loop_step, self.loop_ban, self.loop_ban_until, self.ban_blocks = 0, -99, set(), 0, 0
         self.task_toks = task_tokens(task)
         self.task_text, self.destructive_ok = task, bool(DESTRUCTIVE_TASK_RE.search(task))
-        kind0 = self.mode if self.mode in ("terminal", "screen") else task_kind(task)
-        self.term_only = kind0 == "terminal"
+        kind0 = "terminal"
+        self.term_only = True
         self.simple = self.term_only and task_is_simple(task)
         self.left_term, self.screen_task, self.return_term = False, task, self.term_only
         self.last_model = None
@@ -4280,10 +4184,9 @@ class Agent(V4Mixin, brain.BrainMixin):
             if self.term_only and kl in ("home", "back", "hide_keyboard"):
                 term_block = ("BLOCKED (not executed): this is a TERMINAL task: do not leave Termux. Use shell/read_file/web_search/web_fetch/download "
                               "(their output is already shown to the user). If you already have the answer, call done now.")
-            elif self.term_only and kl in UI_ACTIONS:  # o pedido precisa mesmo da tela: escala para o modelo de visao, sem avisar o usuario
-                self.term_only = False
-                self.sys_prompt = self.prompt_for(task)
-                log(f"  {C.DIM}(precisa da tela: {short_model(self.model)} assume){C.R}")
+            elif kl in UI_ACTIONS or kl in {"send_file", "set_alarm", "set_timer", "device", "time_picker_set", "listen", "speak", "play_and_read"}:
+                term_block = ("BLOCKED (not executed): esta edição aceita apenas comandos textuais no Termux; nao controla apps/tela, "
+                              "nao acessa audio e nao altera configuracoes do Android.")
             g = None if term_block else self.guard(a, n)
             if term_block:
                 res = term_block
@@ -4324,22 +4227,16 @@ def doctor():
         log(f"  {mark} {name}" + ("" if ok else f"  {C.DIM}-> {tip}{C.R}"))
     log(f"{C.B}Diagnostico:{C.R}")
     try:
-        d = Root()
-        row("root (su)", True)
-        row("screencap via root", d.screenshot()[:8] == PNG_SIG, "deixe a tela ligada e desbloqueada e rode de novo")
-        row("uiautomator via root", "<hierarchy" in d.dump(), "tela travada/animada? va para a tela inicial e rode de novo")
-    except SystemExit as e:
-        row("root (su)", False, str(e))
-    row("Pillow (grade/zoom/JPEG)", Image is not None, "pkg install python-pillow")
+        uid = TermuxDevice().sh("id -u").strip()
+        row("Termux sem root", bool(uid) and uid != "0", "execute como usuario normal")
+    except Exception as e:
+        row("shell Termux", False, str(e))
     try:
         aud = subprocess.run(["dpkg", "--audit"], capture_output=True, timeout=20).stdout.strip()
     except Exception:
         aud = b""
     row("dpkg saudavel", not aud, "rode: dpkg --configure -a")
-    row("ffmpeg", bool(shutil.which("ffmpeg")), "pkg install ffmpeg")
     row("termux-notification (aviso ao terminar)", bool(shutil.which("termux-notification")), "pkg install termux-api + app Termux:API")
-    row("termux-microphone-record", bool(shutil.which("termux-microphone-record")), "pkg install termux-api + app Termux:API")
-    row("termux-share (send_file)", bool(shutil.which("termux-share")), "pkg install termux-api + app Termux:API")
     try:
         http_get("https://duckduckgo.com/", 8, 20000)
         row("internet (web_search/web_fetch/download)", True)
@@ -4347,8 +4244,6 @@ def doctor():
         row("internet (web_search/web_fetch/download)", False, f"sem acesso HTTPS ({_trim(e, 60)}); confira a rede/pkg install ca-certificates")
     row("comando 'phoneagent' no PATH (roda de qualquer pasta)", bool(shutil.which("phoneagent")), "rode ./setup.sh de novo")
     row("armazenamento (~/storage)", os.path.isdir(os.path.join(HOME, "storage")), "rode: termux-setup-storage")
-    row("whisper-cli", bool(find_whisper()), "rode ./setup.sh")
-    row("modelo whisper", bool(find_whisper_model("base")), "rode ./setup.sh (baixa o 'base')")
     try:
         names = [x["name"] for x in ollama("/api/tags", timeout=8).get("models", [])]
         row(f"Ollama em {HOST} ({len(names)} modelos)", True)
@@ -4377,41 +4272,33 @@ def load_task_text(raw):
 
 
 def main():
-    p = argparse.ArgumentParser(description="Agente de IA que controla o Android via root (su) + Ollama")
+    p = argparse.ArgumentParser(description="Agente textual para Termux, sem root, com Ollama")
     p.add_argument("task", nargs="*", help="tarefa em linguagem natural, ou caminho de um .txt com a tarefa (vazio = modo interativo)")
-    p.add_argument("--model", help="modelo principal (visao/tela). Padrao: salvo em ~/.phoneagent.json")
+    p.add_argument("--model", help="modelo principal de texto. Padrao: salvo em ~/.phoneagent.json")
     p.add_argument("--text-model", help="modelo so de TEXTO para terminal/plano/auditoria, ex: gpt-oss:120b-cloud ( 'same' = desliga)")
-    p.add_argument("--route", choices=["auto", "hybrid", "vision", "text"], default="auto",
-                   help="auto: terminal->texto, tela->visao | hybrid: visao descreve e o modelo de texto decide | vision: so o principal")
-    p.add_argument("--mode", choices=["auto", "terminal", "screen"], default="auto", help="terminal = sem screenshots (tarefas de CMD)")
+    p.add_argument("--route", choices=["text"], default="text", help="somente ferramentas textuais")
+    p.add_argument("--mode", choices=["terminal"], default="terminal", help="modo textual, sem acesso a tela")
     p.add_argument("--pick-models", action="store_true", help="abre o menu para trocar os modelos e salva")
     p.add_argument("--allow-risky", action="store_true", help="desliga o bloqueio de comandos destrutivos (rm, kill, mount...)")
-    p.add_argument("--vision", action="store_true", help="forca enviar screenshot (padrao: automatico se o modelo tem visao)")
-    p.add_argument("--no-vision", action="store_true", help="nunca enviar screenshot (so arvore de UI)")
     p.add_argument("--max-steps", type=int, default=0, help="0 = sem limite (padrao); a tarefa so para com done/fail")
     p.add_argument("--delay", type=float, default=1.0, help="espera apos cada acao (s)")
     p.add_argument("--ctx", type=int, default=16384, help="num_ctx do Ollama")
     p.add_argument("--timeout", type=int, default=180, help="timeout por resposta do modelo (s)")
-    p.add_argument("--img-max", type=int, default=1280, help="maior lado do screenshot enviado (px)")
-    p.add_argument("--asr-model", default="base", help="modelo whisper.cpp: tiny|base|small|medium")
-    p.add_argument("--audio-lang", default="auto", help="idioma do audio para o whisper (ex: en, pt, es); auto detecta")
-    p.add_argument("--audio-max", type=int, default=240, help="maximo de segundos gravados por audio (padrao 240)")
     p.add_argument("--no-ask", action="store_true", help="nunca perguntar ao humano (execucao sem supervisao): pedidos para tocar em arquivos alheios sao NEGADOS")
     p.add_argument("--keep-tmp", action="store_true", help="nao apagar a pasta temporaria ($PA_TMP) no fim (para depurar)")
     p.add_argument("--keep-ollama", action="store_true", help="nao encerrar o Ollama no fim (mesmo que o phoneagent o tenha iniciado)")
     p.add_argument("--no-ollama-start", action="store_true", help="nao iniciar o Ollama sozinho")
     p.add_argument("--step", action="store_true", help="confirmar cada acao antes de executar")
     p.add_argument("--no-home", action="store_true", help="(sem efeito desde a v5: o agente nunca aperta HOME no inicio)")
-    p.add_argument("--no-audio", action="store_true", help="desliga a captura automatica de audio ao tocar em play")
     p.add_argument("--no-notify", action="store_true", help="nao enviar notificacao ao terminar a tarefa")
     p.add_argument("--test-notify", action="store_true", help="envia uma notificacao de teste e sai")
-    p.add_argument("--debug", action="store_true", help="guarda os audios gravados em ~/phoneagent_shots")
-    p.add_argument("--no-fast", action="store_true", help="desliga os atalhos de intencao (alarme, timer, volume, wifi...): tudo passa pelo modelo")
     p.add_argument("--learn", metavar="TEXTO", help="ensina uma licao permanente (ex.: --learn 'para alarme use set_alarm') e sai")
     p.add_argument("--lessons", action="store_true", help="lista as licoes aprendidas e sai")
     p.add_argument("--doctor", action="store_true", help="confere dependencias e sai")
-    p.add_argument("--test-audio", action="store_true", help="grava 8s do microfone, transcreve e sai")
     args = p.parse_args()
+
+    if os.geteuid() == 0:
+        sys.exit("Nao execute o PhoneAgent como root; abra uma sessao normal do Termux.")
 
     if args.doctor:
         ok, why = ensure_ollama(not args.no_ollama_start, args.keep_ollama)
@@ -4430,16 +4317,12 @@ def main():
             sys.exit("termux-notification ausente. Rode: pkg install termux-api (e instale o app Termux:API)")
         subprocess.run(["termux-notification", "--id", "phoneagent", "--title", "✅ phoneagent: teste", "--content",
                         "Se voce viu isso, as notificacoes funcionam.", "--priority", "high", "--sound", "--vibrate", "300,150,300"])
-        log("notificacao enviada. Se nao apareceu: su -c 'pm grant com.termux.api android.permission.POST_NOTIFICATIONS' "
-            "(o setup.sh ja faz isso) e libere notificacoes do Termux:API nas configuracoes do Android")
+        log("notificacao enviada; permissao pode ser ajustada nas configuracoes do Android")
         return
-    dev = Root()
-    if args.test_audio:
-        ag = Agent(dev, None, asr_model=args.asr_model, audio_lang=args.audio_lang)
-        ag.debug = True
-        log("Toque um audio/video ou fale perto do microfone AGORA (gravando ~8s)...")
-        log(ag.capture_audio(None, 8))
-        return
+    try:
+        dev = TermuxDevice()
+    except RuntimeError as e:
+        sys.exit(str(e))
     global _LOGFILE
     try:
         os.makedirs(LOG_DIR, exist_ok=True)
@@ -4458,17 +4341,13 @@ def main():
         ensure_model(tmodel)
     if shutil.which("termux-wake-lock"):
         subprocess.run(["termux-wake-lock"])
-    vision = True if args.vision else (False if args.no_vision else model_has_vision(model))
-    agent = Agent(dev, model, vision, args.delay, args.step, not args.no_home, args.ctx, args.timeout, args.img_max,
-                  args.asr_model, args.audio_lang)
-    agent.audio, agent.debug, agent.audio_max = not args.no_audio, args.debug, args.audio_max
-    agent.fast_enabled = not args.no_fast
+    agent = Agent(dev, model, False, args.delay, args.step, not args.no_home, args.ctx, args.timeout)
+    agent.audio = False
+    agent.fast_enabled = False
     agent.notify_on = not args.no_notify
     agent.can_ask, agent.keep_tmp = not args.no_ask, args.keep_tmp
-    agent.text_model, agent.route, agent.mode, agent.allow_risky = tmodel, args.route, args.mode, args.allow_risky
+    agent.text_model, agent.route, agent.mode, agent.allow_risky = tmodel, "text", "terminal", args.allow_risky
     welcome(agent, dev)
-    if Image is None:
-        log(f"{C.YELLOW}! dica: pkg install python-pillow (necessario para grade, zoom e screenshots leves){C.R}")
     for m in {model, tmodel} - {None}:  # pre-carrega modelos locais: evita a 1a resposta lenta/timeout
         if "cloud" in m:
             continue
@@ -4495,8 +4374,7 @@ def main():
 def welcome(agent, dev):
     tm = agent.text_model
     log(f"{C.ORG}✻{C.R} {C.B}phoneagent{C.R} {C.GRAY}{BUILD}{C.R}")
-    log(f"  {C.GRAY}terminal → {short_model(tm) if tm else short_model(agent.model)}   tela → {short_model(agent.model)}"
-        f"{'' if agent.vision else ' (sem visão)'}   {agent.start_cwd}{C.R}")
+    log(f"  {C.GRAY}somente texto · {short_model(tm) if tm else short_model(agent.model)}   {agent.start_cwd}{C.R}")
     log(f"  {C.GRAY}/help para comandos · @arquivo cita um arquivo{C.R}")
 
 
@@ -4508,15 +4386,15 @@ def lessons_text(st):
 
 HELP = """  /learn TEXTO      ensina uma licao permanente (entra no prompt das tarefas parecidas)
   /lessons          lista o que o agente aprendeu    /forget N|all  esquece uma licao
-  /fast on|off      liga/desliga os atalhos de intencao (alarme, timer, volume, wifi, abrir app)
+    /fast off         desliga atalhos de intencao do Android
   /cd PASTA         muda a pasta de trabalho (como no Claude Code, a pasta atual e o contexto)
   /pwd              mostra a pasta de trabalho
   /init             cria um PHONEAGENT.md aqui (instrucoes permanentes deste projeto)
   /memory           mostra os arquivos de instrucoes carregados
-  /model            trocar modelo principal (tela/visao)
+    /model            trocar modelo principal de texto
   /text             trocar modelo de texto (terminal, plano, auditoria) - ideal: nuvem
-  /route X          auto | hybrid | vision | text
-  /mode X           auto | terminal | screen
+    /route text       manter ferramentas textuais
+    /mode terminal    manter modo textual
   /status           mostra a configuracao atual
   /doctor           confere dependencias
   /clear            limpa a tela
@@ -4526,30 +4404,26 @@ HELP = """  /learn TEXTO      ensina uma licao permanente (entra no prompt das t
 def handle_cmd(agent, line):
     cmd, _, arg = line.strip().partition(" ")
     arg = arg.strip()
-    cfg_key = {"/model": "vision_model", "/text": "text_model"}
+    cfg_key = {"/model": "text_model", "/text": "text_model"}
     if cmd in cfg_key:
         key = cfg_key[cmd]
-        new = pick_model(arg or None, key, "Modelo principal (tela)" if key == "vision_model" else "Modelo de TEXTO", key == "text_model", not arg)
+        new = pick_model(arg or None, key, "Modelo de TEXTO", True, not arg)
         if arg:
             cfg = load_cfg()
             cfg[key] = arg
             save_cfg(cfg)
-        if key == "vision_model" and new:
-            agent.model, agent.vision = new, model_has_vision(new)
-        elif key == "text_model":
-            agent.text_model = new if new != agent.model else None
-            agent.text_bad_until = 0
-            if agent.text_model:
-                ensure_model(agent.text_model)
-        log(f"  {C.GREEN}✓{C.R} tela: {agent.model} · texto: {agent.text_model or 'igual ao principal'}")
-    elif cmd == "/route" and arg in ("auto", "hybrid", "vision", "text"):
-        agent.route = arg
-        log(f"  {C.GREEN}✓{C.R} rota: {arg}")
-    elif cmd == "/mode" and arg in ("auto", "terminal", "screen"):
-        agent.mode = arg
-        log(f"  {C.GREEN}✓{C.R} modo: {arg}")
+        agent.model, agent.text_model = new, None
+        agent.text_bad_until = 0
+        ensure_model(new)
+        log(f"  {C.GREEN}✓{C.R} modelo de texto: {agent.model}")
+    elif cmd == "/route" and arg == "text":
+        agent.route = "text"
+        log(f"  {C.GREEN}✓{C.R} rota textual")
+    elif cmd == "/mode" and arg == "terminal":
+        agent.mode = "terminal"
+        log(f"  {C.GREEN}✓{C.R} modo textual")
     elif cmd == "/status":
-        log(f"  tela: {agent.model} (visao {'on' if agent.vision else 'off'}) · texto: {agent.text_model or '-'} · rota: {agent.route} · modo: {agent.mode}")
+        log(f"  modelo de texto: {agent.text_model or agent.model} · modo: textual")
     elif cmd == "/cd":
         d = os.path.abspath(os.path.expanduser(arg or "~") if os.path.isabs(os.path.expanduser(arg or "~")) else os.path.join(agent.start_cwd, arg))
         if os.path.isdir(d):
@@ -4580,9 +4454,9 @@ def handle_cmd(agent, line):
         log(lessons_text(agent.lessons))
     elif cmd == "/forget":
         log(f"  {C.GREEN}✓{C.R} {agent.lessons.forget(arg)} licao(oes) removida(s)" if arg else "  uso: /forget N  ou  /forget all")
-    elif cmd == "/fast" and arg in ("on", "off"):
-        agent.fast_enabled = arg == "on"
-        log(f"  {C.GREEN}✓{C.R} atalhos: {arg}")
+    elif cmd == "/fast" and arg == "off":
+        agent.fast_enabled = False
+        log(f"  {C.GREEN}✓{C.R} atalhos do Android desativados")
     elif cmd == "/doctor":
         doctor()
     elif cmd == "/clear":

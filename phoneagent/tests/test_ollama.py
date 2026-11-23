@@ -1,7 +1,7 @@
 """Testa o autostart/stop do Ollama com um binario falso (nao toca no seu Ollama real; porta 11999)."""
 import os, sys, subprocess, time, shutil
 os.environ["HOME"]="/tmp/pa_test_h5"; shutil.rmtree("/tmp/pa_test_h5",ignore_errors=True); os.makedirs("/tmp/pa_test_h5")
-os.environ["OLLAMA_HOST"]="127.0.0.1:11999"; HERE=os.path.dirname(os.path.abspath(__file__)); os.makedirs("/tmp/pa_fakebin",exist_ok=True); shutil.copy(HERE+"/fake_ollama","/tmp/pa_fakebin/ollama"); os.environ["PATH"]="/tmp/pa_fakebin:"+os.environ["PATH"]
+os.environ["OLLAMA_HOST"]="127.0.0.1:11999"; HERE=os.path.dirname(os.path.abspath(__file__)); os.makedirs("/tmp/pa_fakebin",exist_ok=True); shutil.copy(HERE+"/fake_ollama","/tmp/pa_fakebin/ollama"); os.chmod("/tmp/pa_fakebin/ollama",0o755); os.environ["PATH"]="/tmp/pa_fakebin:"+os.environ["PATH"]
 sys.path.insert(0,os.path.join(os.path.dirname(os.path.abspath(__file__)),".."))
 import agent as A
 ok=lambda c,m: print(("PASS" if c else "FAIL"),m)

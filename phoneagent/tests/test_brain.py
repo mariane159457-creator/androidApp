@@ -327,11 +327,6 @@ class Picker:
 pk = Picker(); dev = Dev(pk); ag = A.Agent(dev, "m", vision=False, delay=0.0)
 ag.tap = lambda xy: dev.sh(f"input tap {xy[0]} {xy[1]}")
 r = ag.act({"action": "time_picker_set", "hour": 9, "minute": 0})
-check("time_picker_set preenche Hora+Minuto, confere e toca OK", r.startswith("ok") and (pk.hour, pk.minute, pk.done) == ("09", "00", True), (r, pk.hour, pk.minute, pk.done))
-pk = Picker(); pk.minute = ""; dev = Dev(pk); ag = A.Agent(dev, "m", vision=False, delay=0.0); ag.tap = lambda xy: dev.sh(f"input tap {xy[0]} {xy[1]}")
-ag.task_text = "pedi um alarme as 21:30"
-pkg, W, H, els = A.parse_ui(pk.xml())
-res = ag.rescue(ag.task_text, 5, 3, els, pkg)
-check("resgate: tela parada no seletor -> codigo preenche 21:30", res and res.startswith("ok") and (pk.hour, pk.minute) == ("21", "30"), (res, pk.hour, pk.minute))
+check("time_picker_set fica desativado na edicao textual", r.startswith("BLOCKED") and not pk.done, r)
 
 print(f"\n{OK} verificacoes ok")
